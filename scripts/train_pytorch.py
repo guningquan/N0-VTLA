@@ -46,6 +46,7 @@ import wandb
 import n0vtla.models.model
 import n0vtla.models.pi0_config
 import n0vtla.models_pytorch.gemma_pytorch
+import n0vtla.models_pytorch.input_resolution as _input_resolution
 import n0vtla.models_pytorch.pi0_pytorch
 import n0vtla.shared.normalize as _normalize
 import n0vtla.training.config as _config
@@ -322,6 +323,69 @@ def wait_for_path_state(path, *, should_exist: bool, timeout_s: float = 120.0, p
         time.sleep(poll_s)
 
 
+def build_param_groups(model, *, phase_a_steps: int, predictor_lr_scale: float, phase_ramp_steps: int, is_main: bool):
+    """Optimizer param groups for the phase-A curriculum / predictor lr scale (see train_loop).
+
+    The 1A embeddings (input_res.*, present only when input_res_mode != "off") get their own group
+    in every branch, frozen during phase A like the tactile feature stack (z must hold still while
+    the expert learns to read it) and at FULL lr after it: they start at 0, and at the predictor
+    scale (0.1x) they would barely move. Without them the groups are exactly the previous ones.
+    """
+    raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    res_prefix = _input_resolution.INPUT_RES_PREFIX
+    named_params = [(n, p) for n, p in raw_model.named_parameters() if not n.startswith(res_prefix)]
+    res_params = [p for n, p in raw_model.named_parameters() if n.startswith(res_prefix)]
+    res_groups = [{"params": res_params, "lr_scale": 1.0, "phase_frozen": True}] if res_params else []
+    if phase_a_steps > 0:
+        feat_prefixes = ("tactile_predictor.", "tactile_encoder.")
+        zwire_prefixes = ("z_proj.",)
+        base_params, feat_params, zwire_params = [], [], []
+        for n, p in named_params:
+            if n.startswith(feat_prefixes):
+                feat_params.append(p)
+            elif n.startswith(zwire_prefixes):
+                zwire_params.append(p)
+            else:
+                base_params.append(p)
+        param_groups = [
+            {"params": base_params},
+            {"params": feat_params, "lr_scale": predictor_lr_scale, "phase_frozen": True},
+            {"params": zwire_params, "lr_scale": predictor_lr_scale, "phase_zwire": True},
+            *res_groups,
+        ]
+        if is_main:
+            logging.info(
+                f"phase-A curriculum ENABLED: steps<{phase_a_steps} freeze feat "
+                f"({len(feat_params)} tensors, lr=0) + vl_dropout=1.0; z_proj "
+                f"({len(zwire_params)} tensors) at FULL lr in phase A -> {predictor_lr_scale}x after; "
+                f"vl mask ramps to config over {phase_ramp_steps} steps"
+            )
+    elif predictor_lr_scale != 1.0:
+        predictor_prefixes = ("tactile_predictor.", "z_proj.", "tactile_encoder.")
+        base_params = [p for n, p in named_params if not n.startswith(predictor_prefixes)]
+        predictor_params = [p for n, p in named_params if n.startswith(predictor_prefixes)]
+        param_groups = [
+            {"params": base_params},
+            {"params": predictor_params, "lr_scale": predictor_lr_scale},
+            *res_groups,
+        ]
+        if is_main:
+            logging.info(
+                f"Predictor param group: {len(predictor_params)} tensors at lr_scale={predictor_lr_scale} "
+                f"(base group: {len(base_params)} tensors)"
+            )
+    elif res_groups:
+        param_groups = [{"params": [p for _, p in named_params]}, *res_groups]
+    else:
+        param_groups = model.parameters()
+    if is_main and res_groups:
+        logging.info(
+            f"1A input_res param group: {len(res_params)} tensors, frozen during phase A "
+            f"({phase_a_steps} steps), lr_scale=1.0 after"
+        )
+    return param_groups
+
+
 def train_loop(config: _config.TrainConfig):
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
@@ -507,17 +571,18 @@ def train_loop(config: _config.TrainConfig):
     # in e2e — z becomes a FIXED function of inputs, killing the predictor-drift feedback loop by
     # exponential grad ramp from ~step 2000, same signature as random init — so the drift source is
     # "predictor trainable with no anchor in e2e", not init quality). z_proj (linear adapter into the
-    # expert) and z_gate stay trainable. Default off = unchanged behavior.
+    # expert) and z_gate stay trainable. With 1A the view / level embeddings (input_res.*) feed the
+    # predictor's keys, so they are part of the frozen stack too. Default off = unchanged behavior.
     if os.environ.get("VTLA_PREDICTOR_FREEZE", "0") == "1":
         raw_m = model
         frozen_n = 0
         for n, p in raw_m.named_parameters():
-            if n.startswith(("tactile_predictor.", "tactile_encoder.")):
+            if n.startswith(("tactile_predictor.", "tactile_encoder.", _input_resolution.INPUT_RES_PREFIX)):
                 p.requires_grad = False
                 frozen_n += 1
         if is_main:
-            logging.info(f"VTLA_PREDICTOR_FREEZE=1: froze {frozen_n} tactile_predictor/tactile_encoder tensors "
-                         f"(z_proj + z_gate stay trainable)")
+            logging.info(f"VTLA_PREDICTOR_FREEZE=1: froze {frozen_n} tactile_predictor/tactile_encoder/input_res "
+                         f"tensors (z_proj + z_gate stay trainable)")
 
 
     skip_ddp_init_sync = use_ddp and (config.pytorch_weight_path is not None or resuming)
@@ -547,6 +612,17 @@ def train_loop(config: _config.TrainConfig):
             model_path,
             strict=False,
         )
+        # A checkpoint trained without 1A (n0-vtla-base, B0) has no input_res.* entries; those keep
+        # their initial values (zero embeddings, configured statistics). Only that prefix is set
+        # aside; every other missing / unexpected key is reported exactly as before. A 1A
+        # checkpoint under a config with 1A off raises (its allocation would be silently dropped).
+        missing, input_res_missing = _input_resolution.split_checkpoint_keys(
+            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model),
+            missing,
+            unexpected,
+        )
+        if input_res_missing:
+            logging.info(f"Checkpoint has no 1A weights, keeping their initial values: {input_res_missing}")
         if missing or unexpected:
             logging.info(f"Loaded base weights with missing keys={missing}, unexpected keys={unexpected}")
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
@@ -584,44 +660,13 @@ def train_loop(config: _config.TrainConfig):
     phase_a_steps = int(os.environ.get("VTLA_PHASE_A_STEPS", "0"))
     phase_ramp_steps = int(os.environ.get("VTLA_PHASE_RAMP_STEPS", "500"))
     raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-    if phase_a_steps > 0:
-        feat_prefixes = ("tactile_predictor.", "tactile_encoder.")
-        zwire_prefixes = ("z_proj.",)
-        base_params, feat_params, zwire_params = [], [], []
-        for n, p in raw_model.named_parameters():
-            if n.startswith(feat_prefixes):
-                feat_params.append(p)
-            elif n.startswith(zwire_prefixes):
-                zwire_params.append(p)
-            else:
-                base_params.append(p)
-        param_groups = [
-            {"params": base_params},
-            {"params": feat_params, "lr_scale": predictor_lr_scale, "phase_frozen": True},
-            {"params": zwire_params, "lr_scale": predictor_lr_scale, "phase_zwire": True},
-        ]
-        if is_main:
-            logging.info(
-                f"phase-A curriculum ENABLED: steps<{phase_a_steps} freeze feat "
-                f"({len(feat_params)} tensors, lr=0) + vl_dropout=1.0; z_proj "
-                f"({len(zwire_params)} tensors) at FULL lr in phase A -> {predictor_lr_scale}x after; "
-                f"vl mask ramps to config over {phase_ramp_steps} steps"
-            )
-    elif predictor_lr_scale != 1.0:
-        predictor_prefixes = ("tactile_predictor.", "z_proj.", "tactile_encoder.")
-        base_params = [p for n, p in raw_model.named_parameters() if not n.startswith(predictor_prefixes)]
-        predictor_params = [p for n, p in raw_model.named_parameters() if n.startswith(predictor_prefixes)]
-        param_groups = [
-            {"params": base_params},
-            {"params": predictor_params, "lr_scale": predictor_lr_scale},
-        ]
-        if is_main:
-            logging.info(
-                f"Predictor param group: {len(predictor_params)} tensors at lr_scale={predictor_lr_scale} "
-                f"(base group: {len(base_params)} tensors)"
-            )
-    else:
-        param_groups = model.parameters()
+    param_groups = build_param_groups(
+        model,
+        phase_a_steps=phase_a_steps,
+        predictor_lr_scale=predictor_lr_scale,
+        phase_ramp_steps=phase_ramp_steps,
+        is_main=is_main,
+    )
     optim = torch.optim.AdamW(
         param_groups,
         lr=peak_lr,
@@ -635,6 +680,17 @@ def train_loop(config: _config.TrainConfig):
     if resuming:
         global_step = load_checkpoint(model, optim, config.checkpoint_dir, device)
         logging.info(f"Resumed training from step {global_step}")
+
+    # 1A: by now the allocation has its statistics (config / stats JSON, or the checkpoint just
+    # loaded); a rule model without thresholds would train as uniform10 without saying so.
+    input_res = getattr(raw_model, "input_res", None)
+    if input_res is not None:
+        problem = input_res.missing_statistics()
+        if problem:
+            raise ValueError(problem)
+        mismatch = input_res.stats_dataset_mismatch(getattr(config.data, "repo_id", None))
+        if mismatch and is_main:
+            logging.warning(mismatch)
 
     def lr_schedule(step: int):
         if step < warmup_steps:
@@ -678,6 +734,9 @@ def train_loop(config: _config.TrainConfig):
     sample_loss_clip = float(os.environ.get("VTLA_SAMPLE_LOSS_CLIP", "0"))
     if is_main and sample_loss_clip > 0:
         logging.info(f"sample-loss-clip ENABLED (threshold={sample_loss_clip})")
+    # 1A allocation counters (rank 0's batches, reset every log interval): [n_a histogram (V + 1) ;
+    # summed tokens per view (V)], to compare against the offline P(n_a) of the contact statistics.
+    input_res_counts = None
     pbar = (
         tqdm.tqdm(total=config.num_train_steps, initial=global_step, desc="Training", disable=not is_main)
         if is_main
@@ -733,6 +792,13 @@ def train_loop(config: _config.TrainConfig):
             # Forward pass
             losses = model(observation, actions)
             trace_step0("step0 forward_done")
+            input_res_levels = getattr(raw_model, "_last_input_levels", None)
+            if is_main and input_res_levels is not None:
+                n_active = raw_model._last_input_active.sum(dim=1)
+                step_counts = torch.cat(
+                    [torch.bincount(n_active, minlength=input_res_levels.shape[1] + 1), input_res_levels.sum(dim=0)]
+                ).double()
+                input_res_counts = step_counts if input_res_counts is None else input_res_counts + step_counts
             # Ensure losses is a tensor and handle different return types
             if isinstance(losses, list | tuple):
                 losses = torch.stack(losses)
@@ -856,6 +922,16 @@ def train_loop(config: _config.TrainConfig):
                     if avg_grad_norm is not None
                     else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
                 )
+                if input_res_counts is not None:
+                    n_views = (input_res_counts.numel() - 1) // 2
+                    n_samples = input_res_counts[: n_views + 1].sum()
+                    p_na = (input_res_counts[: n_views + 1] / n_samples).tolist()
+                    tokens = (input_res_counts[n_views + 1 :] / n_samples).tolist()
+                    logging.info(
+                        f"input_res: P(n_a)={[round(x, 3) for x in p_na]} "
+                        f"mean tokens per view={[round(x, 2) for x in tokens]} ({int(n_samples)} samples)"
+                    )
+                    input_res_counts = None
 
                 # Log to wandb
                 if config.wandb_enabled and len(infos) > 0:

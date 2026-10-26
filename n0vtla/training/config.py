@@ -1022,6 +1022,56 @@ _CONFIGS = [
     # RoboArena & PolaRiS configs.
 ]
 
+
+def _sim_dual_1a_config(name: str, **input_res) -> TrainConfig:
+    """``sim_dual_arm_tactile`` with ONLY the 1A ``input_res_*`` model fields changed."""
+    base = next(c for c in _CONFIGS if c.name == "sim_dual_arm_tactile")
+    return dataclasses.replace(base, name=name, model=dataclasses.replace(base.model, **input_res))
+
+
+def _sim_dual_1a_stats(name: str) -> str | None:
+    """1A contact statistics: VTLA_1A_STATS, else the stats script's default output location
+    assets/<name>/<VTLA_ASSET_ID>/tactile_contact_stats.json (next to norm_stats.json) if it exists.
+
+    Read at import, like VTLA_DATASET_PATH / VTLA_ASSET_ID. None is fine for serving a trained 1A
+    checkpoint (it carries its thresholds); training refuses to start without statistics.
+    """
+    explicit = os.environ.get("VTLA_1A_STATS")
+    if explicit:
+        return explicit
+    base = next(c for c in _CONFIGS if c.name == "sim_dual_arm_tactile")
+    default = pathlib.Path(base.assets_base_dir) / name / base.data.assets.asset_id / "tactile_contact_stats.json"
+    return str(default.resolve()) if default.is_file() else None
+
+
+# ---------------------------------------------------------------- 1A input resolution (NeoSim)
+# Same data, model and recipe as sim_dual_arm_tactile; only the tactile token allocation differs
+# (n0vtla/models_pytorch/input_resolution.py). NeoSim tactile frames are 240x320, letterboxed to
+# 224x224 with 28 black rows above and below: content box = rows 28-196, all columns. Views follow
+# tactile_image_keys, tactile_a..d = arm A left / right finger, arm B left / right finger, so the
+# sibling (other finger of the same gripper) is (1, 0, 3, 2). Norm stats are looked up under
+# assets/<config name>/<VTLA_ASSET_ID>/ as usual (copy the sim_dual_arm_tactile ones).
+_CONFIGS += [
+    # Equivalence check only: 10 tokens per view == the original g; needs no statistics.
+    _sim_dual_1a_config(
+        "sim_dual_1a_uniform10",
+        input_res_mode="uniform10",
+        input_res_content_box=(28, 196, 0, 224),
+        input_res_sibling=(1, 0, 3, 2),
+    ),
+    # 1A-RULE. tau / tau_floor / P(n_a) are read at model construction from the JSON written by
+    # scripts/tactile_contact_stats.py: VTLA_1A_STATS (must exist when set), else
+    # assets/sim_dual_1a_rule/<VTLA_ASSET_ID>/tactile_contact_stats.json. Training needs them;
+    # serving a trained 1A checkpoint takes them from the checkpoint.
+    _sim_dual_1a_config(
+        "sim_dual_1a_rule",
+        input_res_mode="rule",
+        input_res_content_box=(28, 196, 0, 224),
+        input_res_sibling=(1, 0, 3, 2),
+        input_res_stats=_sim_dual_1a_stats("sim_dual_1a_rule"),
+    ),
+]
+
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}

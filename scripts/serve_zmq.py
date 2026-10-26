@@ -185,9 +185,13 @@ class VtlaZmqServer:
         tactile_views: list[str],
         state_dim: int = 32,
         cameras: Sequence[str] | None = None,
+        input_res_model=None,
     ):
         self._policy = policy
         self._addr = addr
+        # 1A input resolution: the served N0VTLAPolicy when the config enables it (else None). Its
+        # per-predict contact strengths / token counts are logged, one line per action chunk.
+        self._input_res_model = input_res_model
         # Model camera slots this checkpoint was trained with. A single-arm embodiment has no
         # right wrist camera: its dataset has no wrist_r column, so that slot was a zero image
         # with image_mask=False for the whole run. Accepting the client's secondary_image there
@@ -317,6 +321,8 @@ class VtlaZmqServer:
                 )
 
         actions = np.asarray(self._policy.infer(data)["actions"], dtype=np.float32)
+        if self._input_res_model is not None:
+            self._log_input_res()
         actions = _pad_actions(actions, 32)
         # actions is [action_horizon, 32]; the client MUST execute the FULL horizon — a shorter
         # execution stride drops the chunk-tail gripper close (see module DEPLOYMENT note).
@@ -325,6 +331,22 @@ class VtlaZmqServer:
             "actions": actions.tolist(),
             "infer_time_ms": (time.monotonic() - t0) * 1000.0,
         }
+
+    def _log_input_res(self) -> None:
+        """One log line per predict: the 1A contact strength s_k, token count n_k and active flag
+        of every tactile view (model view order), as computed for the chunk just returned."""
+        model = self._input_res_model
+        s, n = model._last_contact_strength, model._last_input_levels  # noqa: SLF001
+        if s is None or n is None:
+            logging.info("input_res: no tactile views in this request")
+            return
+        active = model._last_input_active  # noqa: SLF001
+        logging.info(
+            "input_res s=[%s] n=[%s] active=[%s]",
+            " ".join(f"{v:.4g}" for v in s[0].tolist()),
+            " ".join(str(v) for v in n[0].tolist()),
+            " ".join(str(int(v)) for v in active[0].tolist()),
+        )
 
     # ------------------------------------------------------------------ loop
     def run(self) -> None:
@@ -399,6 +421,17 @@ def main() -> None:
     if getattr(train_config.data, "raw_action_dim", 0) and state_dim < 16:
         cameras = [c for c in CAM_MAP.values() if c != "cam_right_wrist"]
         logging.info("single-arm config: accepting cameras %s (no right wrist)", cameras)
+    # 1A input resolution: log the per-view contact strength / token count of every predict.
+    input_res_model = None
+    if getattr(model, "input_res_mode", "off") != "off":
+        input_res_model = policy._model  # noqa: SLF001
+        input_res = input_res_model.input_res
+        logging.info(
+            "1A input resolution: mode=%s threshold=%s (views %s)",
+            input_res.mode,
+            [round(float(v), 6) for v in input_res.threshold],
+            tactile_views,
+        )
     server = VtlaZmqServer(
         policy,
         cli.addr,
@@ -407,6 +440,7 @@ def main() -> None:
         tactile_views,
         state_dim,
         cameras,
+        input_res_model,
     )
     server.run()
 

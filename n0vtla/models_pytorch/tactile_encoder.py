@@ -98,17 +98,18 @@ class FrozenDINOv2TactileEncoder(nn.Module):
         self.backbone.eval()
         return self
 
-    def _pool_spatial(self, spatial_tokens: torch.Tensor) -> torch.Tensor:
+    def _pool_spatial(self, spatial_tokens: torch.Tensor, pool_grid: int | None = None) -> torch.Tensor:
         """Reshape (B, S, D) patch tokens back to a (B, D, side, side) grid and
         adaptive-avg-pool to pool_grid x pool_grid, returning (B, pool_grid**2, D).
 
+        ``pool_grid`` defaults to ``self.pool_grid``; encode_backbone_multi passes each level's grid.
         Assumes S is a perfect square (DINOv2 emits a square patch grid, e.g. 16x16=256).
         """
         B, S, D = spatial_tokens.shape
         side = int(S ** 0.5)
         assert side * side == S, f"non-square spatial: {S}"
         grid = spatial_tokens.transpose(1, 2).reshape(B, D, side, side)
-        pooled = F.adaptive_avg_pool2d(grid, self.pool_grid)
+        pooled = F.adaptive_avg_pool2d(grid, self.pool_grid if pool_grid is None else pool_grid)
         return pooled.flatten(2).transpose(1, 2)
 
     def _dinov2_preprocess(self, imgs: torch.Tensor) -> torch.Tensor:
@@ -147,6 +148,25 @@ class FrozenDINOv2TactileEncoder(nn.Module):
         cls = hs[:, :1]
         pooled = self._pool_spatial(hs[:, 1:])
         return torch.cat([cls, pooled], dim=1)
+
+    def encode_backbone_multi(
+        self, imgs: torch.Tensor, grids: tuple[int, ...] = (1, 2, 3, 4, 5)
+    ) -> dict[int, torch.Tensor]:
+        """Frozen backbone ONCE -> every pooling level of the same patch grid, BEFORE proj.
+
+        Used by the 1A input-resolution path (input_resolution.py), where each view picks its own
+        level. Returns ``{0: CLS (B, 1, 768), g: [CLS ; g x g pooled] (B, 1 + g^2, 768) for g in grids}``.
+        Same preprocessing, backbone call and pooling code as ``encode_backbone``, so the level
+        ``g == pool_grid`` (3) is bit-identical to ``encode_backbone``.
+        """
+        imgs = self._dinov2_preprocess(imgs)
+        with torch.no_grad():
+            hs = self.backbone(pixel_values=imgs).last_hidden_state
+        cls = hs[:, :1]
+        out = {0: cls}
+        for g in grids:
+            out[g] = torch.cat([cls, self._pool_spatial(hs[:, 1:], g)], dim=1)
+        return out
 
     def project(self, backbone_tokens: torch.Tensor) -> torch.Tensor:
         """Apply the trainable projection to backbone tokens (online or cached).

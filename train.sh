@@ -99,12 +99,40 @@ for label, path in (("pretrained checkpoint", checkpoint), ("dataset", dataset),
 
 AutoConfig.from_pretrained("facebook/dinov2-base", local_files_only=True)
 
+input_res = None
+if getattr(cfg.model, "input_res_mode", "off") != "off":
+    # 1A input resolution: build the allocator alone (no weights) so a bad mode, a missing or
+    # mismatched stats JSON, or missing thresholds fail here instead of after the data loader and
+    # model are up. A 1A pretrained checkpoint brings its own statistics (and must match the mode).
+    from safetensors import safe_open
+
+    from n0vtla.models_pytorch.input_resolution import INPUT_RES_PREFIX
+    from n0vtla.models_pytorch.input_resolution import InputResolution
+
+    input_res = InputResolution.from_config(cfg.model, 2048)
+    with safe_open(str(checkpoint), "pt") as f:
+        names = {INPUT_RES_PREFIX + n: n for n in ("tau", "tau_floor", "na_hist", "mode_id")}
+        buffers = {names[k]: f.get_tensor(k) for k in f.keys() if k in names}
+    try:
+        input_res.load_state_dict(buffers, strict=False)
+    except RuntimeError as e:
+        raise SystemExit(f"1A: pretrained checkpoint {checkpoint} does not fit this config: {e}") from None
+    problem = input_res.missing_statistics()
+    if problem:
+        raise SystemExit(f"1A: {problem}")
+    mismatch = input_res.stats_dataset_mismatch(cfg.data.repo_id)
+    if mismatch:
+        print(f"WARNING: {mismatch}")
+
 print(f"environment OK: torch={torch.__version__}, GPUs={visible_gpus}")
 print(f"config OK: {cfg.name}")
 print(f"checkpoint OK: {checkpoint}")
 print(f"dataset OK: {dataset}")
 print(f"norm OK: {norm}")
 print("DINOv2 cache OK")
+if input_res is not None:
+    print(f"1A OK: mode={input_res.mode} threshold={[round(float(t), 6) for t in input_res.threshold]} "
+          f"stats={input_res.stats_path}")
 PY
 
 if [[ "$CHECK_ONLY" == "1" ]]; then

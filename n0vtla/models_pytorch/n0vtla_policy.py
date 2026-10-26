@@ -40,6 +40,7 @@ from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
 from n0vtla.models.pi0_config import Pi0Config
+from n0vtla.models_pytorch.input_resolution import AllocationMode
 from n0vtla.models_pytorch.pi0_pytorch import PI0Pytorch
 from n0vtla.models_pytorch.pi0_pytorch import make_att_2d_masks
 
@@ -119,6 +120,27 @@ class N0VTLAConfig(Pi0Config):
     # scripts/verify_prefix_cache.py confirms cache-on == cache-off (bf16-noise level).
     use_prefix_cache: bool = False
 
+    # 1A input-side dynamic resolution (input_resolution.py): each tactile view's token count
+    # (1/2/5/10/17/26, <= 40 in total) follows its current contact strength. "off" (default)
+    # constructs nothing, so the state_dict key set and _build_g are byte-unchanged. "uniform10",
+    # "uniform5", "random", "rule", "rule_var" create ``input_res`` (zero-init view / level
+    # embeddings + statistics buffers) and route _build_g through the fixed-slot 1A branch.
+    # Latent predictor path only.
+    input_res_mode: AllocationMode = "off"
+    # Content region (r0, r1, c0, c1) of the letterboxed 224x224 tactile frame that the contact
+    # strength looks at. Real robot (700x400 portrait): columns 48-176; NeoSim (240x320): rows 28-196.
+    input_res_content_box: tuple[int, int, int, int] = (0, 224, 48, 176)
+    input_res_topq: float = 0.05   # mean over the largest 5% of pooled cells
+    input_res_pool: int = 4        # pool x pool average pooling before the top-q
+    # Contact statistics; threshold_k = max(tau_k, tau_floor). An explicit value wins, None falls
+    # back to the JSON at ``input_res_stats`` (written by scripts/tactile_contact_stats.py).
+    input_res_tau: tuple[float, ...] | None = None       # (V,) mu_k + 3 sigma_k ("rule", "rule_var")
+    input_res_tau_floor: float | None = None              # None -> stats JSON, else 0
+    input_res_na_hist: tuple[float, ...] | None = None   # (V + 1,) P(n_a) ("random")
+    input_res_stats: str | None = None
+    # The other finger of the same gripper, in tactile_image_keys order.
+    input_res_sibling: tuple[int, ...] = (1, 0, 3, 2)
+
     def load_pytorch(self, train_config, weight_path: str):
         """Serve/eval load path: build N0VTLAPolicy and load the trained weights.
 
@@ -130,13 +152,36 @@ class N0VTLAConfig(Pi0Config):
         # for a predictor checkpoint would silently leave the predictor submodules unloaded on the
         # serve/eval path (create_trained_policy does NOT run the train-script monkey-patch).
         # Build the predictor class here so serve/eval load the trained predictor weights.
+        import logging
+        import os
+
         import safetensors.torch as _st
+
+        from n0vtla.models_pytorch.input_resolution import split_checkpoint_keys
 
         model = N0VTLAPolicy(config=train_config.model)
         missing, unexpected = _st.load_model(model, weight_path, strict=False)
+        # 1A (input_res.*): a 1A checkpoint under a config with 1A off raises here. A checkpoint
+        # trained without 1A has no input_res.* entries; those keep their initial values (zero
+        # embeddings, configured statistics). Only that prefix is set aside; every other missing /
+        # unexpected key is reported exactly as before.
+        missing, input_res_missing = split_checkpoint_keys(model, missing, unexpected)
+        input_res = getattr(model, "input_res", None)
+        if input_res_missing:
+            # Only uniform10 is then the same model (the equivalence check); any other mode would
+            # serve an allocation and zero embeddings the weights were never trained with.
+            if input_res.mode != "uniform10" and os.environ.get("VTLA_1A_ALLOW_UNTRAINED") != "1":
+                raise ValueError(
+                    f"{weight_path} has no 1A weights {input_res_missing} but input_res_mode="
+                    f"{input_res.mode!r}: serve it with the config it was trained with, or set "
+                    "VTLA_1A_ALLOW_UNTRAINED=1 to run the untrained 1A allocation on purpose (diagnostics)"
+                )
+            logging.warning(f"Checkpoint has no 1A weights, keeping their initial values: {input_res_missing}")
+        # The thresholds / P(n_a) come from the checkpoint (a trained 1A run) or from the config.
+        problem = input_res.missing_statistics() if input_res is not None else None
+        if problem:
+            raise ValueError(problem)
         if missing or unexpected:
-            import logging
-
             logging.info(f"Loaded N0VTLAPolicy ckpt with missing={missing}, unexpected={unexpected}")
         return model
 
@@ -197,9 +242,23 @@ class N0VTLAPolicy(PI0Pytorch):
         # trainer (not by this class). v0 holds only {"act": ...}; RESERVED to also carry the
         # Phase-2 predictor-loss parts. Safe to ignore if you are not wiring up loss logging.
         self._last_loss_parts: dict[str, float] = {}
+        # 1A stashes for EXTERNAL logging (serve / trainer), written by _build_g only when
+        # input_res is enabled: per-view contact strength s, token counts n and active flags, each
+        # (B, V) on the CPU in tactile_image_keys order. Stay None when 1A is off.
+        self._last_contact_strength: torch.Tensor | None = None
+        self._last_input_levels: torch.Tensor | None = None
+        self._last_input_active: torch.Tensor | None = None
 
         # --- baseline tactile-injection modes (ablation; see N0VTLAConfig.tactile_mode) ---
         self.tactile_mode = str(getattr(config, "tactile_mode", "latent"))
+        # 1A input resolution (N0VTLAConfig.input_res_mode) is defined on the latent predictor path
+        # only; refuse it elsewhere instead of silently ignoring it.
+        self.input_res_mode = str(getattr(config, "input_res_mode", "off"))
+        if self.input_res_mode != "off" and not (self.tactile_predictor_enabled and self.tactile_mode == "latent"):
+            raise ValueError(
+                f"input_res_mode={self.input_res_mode!r} needs tactile_predictor_enabled=True and "
+                f"tactile_mode='latent' (got {self.tactile_predictor_enabled}, {self.tactile_mode!r})"
+            )
         if self.tactile_mode != "latent":
             assert not self.tactile_predictor_enabled, "concat modes exclude the z/predictor path"
             from n0vtla.models_pytorch.tactile_encoder import FrozenDINOv2TactileEncoder
@@ -270,6 +329,13 @@ class N0VTLAPolicy(PI0Pytorch):
             self.g_proj = nn.Linear(llm_dim, self.action_in_proj.out_features)
             self.g_gate = nn.Parameter(torch.zeros(1))
 
+        # 1A input-side dynamic resolution (input_resolution.py): created ONLY when enabled, so an
+        # "off" model's state_dict key set and _build_g stay byte-unchanged. Holds the zero-init
+        # view / level embeddings and the contact-statistics buffers (all under "input_res.").
+        if self.input_res_mode != "off":
+            from n0vtla.models_pytorch.input_resolution import InputResolution
+
+            self.input_res = InputResolution.from_config(config, llm_dim)
 
     # ------------------------------------------------------------------
     # Tactile key discovery (generalize to N views; never hardcode 2)
@@ -379,7 +445,12 @@ class N0VTLAPolicy(PI0Pytorch):
         (_forward_predictor / _sample_actions_predictor read it right after _compute_z). A stash, not a
         return-signature change, because _compute_z's 3-tuple unpack is frozen by external
         scripts (eval_stage1_predictor.py / probe_z_tactile_dependence.py) that must not be touched.
+
+        With 1A enabled (``input_res``) the token layout is the fixed-slot one of
+        ``_build_g_input_res``; the return format is the same.
         """
+        if getattr(self, "input_res", None) is not None:
+            return self._build_g_input_res(tac_t, tac_0)
         keys = [k for k in tac_t if k in tac_0]
         if not keys:
             self._last_g_mask = None
@@ -402,6 +473,73 @@ class N0VTLAPolicy(PI0Pytorch):
         g_mask = torch.cat(tmask, dim=1)                    # (B, n_tokens * V)
         has_tac = g_mask.any(dim=1)                         # (B,)
         self._last_g_mask = g_mask
+        return g, g_mask, has_tac
+
+    def _build_g_input_res(self, tac_t: dict, tac_0: dict):
+        """1A branch of _build_g (input_resolution.py): per-view token counts from the contact rule.
+
+        Views follow ``config.tactile_image_keys`` (the order the original branch concatenates
+        them in) and each owns MAX_TOKENS_PER_VIEW (26) fixed slots: view k fills its first n_k
+        slots and g_mask marks exactly those, so g is (B, 26 * V, D) with <= 40 valid tokens per
+        row. A view that is absent or a placeholder (image_mask=False) gets n_k = 0. DINOv2 runs
+        once per view; every level is pooled from that single patch grid. Contact strength and
+        allocation are no-grad rules; only the projection and the view / level embeddings carry
+        gradient. Same (g, g_mask, has_tac) return and ``_last_g_mask`` stash as the original
+        branch, plus the 1A logging stashes (s, n, active).
+        """
+        from n0vtla.models_pytorch import input_resolution as _ir
+
+        views = list(self.config.tactile_image_keys)
+        present = [k in tac_t and k in tac_0 for k in views]
+        any_img = next(iter(tac_t.values()), None)
+        B = any_img.shape[0] if any_img is not None else 0
+        if not any(present):
+            self._last_g_mask = None
+            self._last_contact_strength = self._last_input_levels = self._last_input_active = None
+            return None, None, torch.zeros(B, dtype=torch.bool)
+        device = any_img.device
+        view_masks = getattr(self, "_last_tac_mask", None) or {}
+
+        # Contact strength -> active views -> token counts (no grad; allocation runs on the CPU).
+        s = torch.zeros(B, len(views), dtype=torch.float32, device=device)
+        valid = torch.zeros(B, len(views), dtype=torch.bool, device=device)
+        for v, k in enumerate(views):
+            if not present[v]:
+                continue
+            s[:, v] = self.input_res.contact_strength(tac_t[k], tac_0[k])
+            rk = view_masks.get(k)
+            valid[:, v] = True if rk is None else rk.to(device=device, dtype=torch.bool).reshape(-1)
+        n, active = self.input_res.allocate(s, valid)
+
+        # One backbone pass per view, n_k tokens at level n_k, then proj + view / level embedding.
+        slots = _ir.MAX_TOKENS_PER_VIEW
+        proj = self.tactile_encoder.tactile_proj
+        g = torch.zeros(B, len(views) * slots, proj.out_features, dtype=proj.weight.dtype, device=device)
+        g_mask = torch.zeros(B, len(views) * slots, dtype=torch.bool, device=device)
+        for v, k in enumerate(views):
+            levels = sorted(set(n[:, v].tolist()) - {0})
+            if not levels:
+                continue
+            grids = tuple(_ir.TOKENS_TO_GRID[nt] for nt in levels if _ir.TOKENS_TO_GRID[nt] > 0)
+            multi = self.tactile_encoder.encode_backbone_multi(tac_t[k].float() - tac_0[k].float(), grids)
+            for nt in levels:
+                rows = (n[:, v] == nt).nonzero().flatten().to(device)
+                feats = multi[_ir.TOKENS_TO_GRID[nt]]
+                if rows.numel() < B:
+                    feats = feats[rows]
+                tok = self.input_res.embed(self.tactile_encoder.project(feats), v, nt)   # (b, nt, D)
+                g[rows, v * slots : v * slots + nt] = tok
+                g_mask[rows, v * slots : v * slots + nt] = True
+        if not bool((n > 0).any()):
+            # Every view is a placeholder: nothing was encoded, so tactile_proj and input_res would
+            # drop out of this step's graph (the original branch still encodes placeholders), which
+            # DDP(static_graph=True) rejects. Keep them in the graph with exact-zero gradients.
+            g = g + 0.0 * sum(p.sum() for p in (*proj.parameters(), *self.input_res.parameters()))
+        has_tac = g_mask.any(dim=1)
+        self._last_g_mask = g_mask
+        self._last_contact_strength = s.detach().cpu()
+        self._last_input_levels = n
+        self._last_input_active = active
         return g, g_mask, has_tac
 
     # ------------------------------------------------------------------

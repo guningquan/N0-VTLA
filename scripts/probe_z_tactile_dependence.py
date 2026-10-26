@@ -56,7 +56,9 @@ RUN (single GPU):
         --batches 8 --batch-size 16 --out-json probe.json --markdown
 
 The checkpoint must be a FULL-key state_dict (what scripts/train_pytorch.py saves); the probe
-fails loudly if any key is missing or unexpected.
+fails loudly if any key is missing or unexpected. The one exception: under a 1A config
+(input_res_mode != "off") a checkpoint trained without 1A (e.g. B0) lacks the input_res.* entries,
+which then keep their initial values (zero embeddings, configured contact statistics).
 """
 from __future__ import annotations
 
@@ -122,10 +124,21 @@ def build(args):
 
     import safetensors.torch as _st
 
+    from n0vtla.models_pytorch.input_resolution import split_checkpoint_keys
+
     missing, unexpected = _st.load_model(model, args.ckpt, strict=False, device=str(device))
     print(f"[ckpt] {args.ckpt}\n[ckpt] missing={sorted(missing)}\n[ckpt] unexpected={sorted(unexpected)}", flush=True)
+    # 1A config + a checkpoint trained without 1A (the pre-training check on B0): only input_res.*
+    # may be missing; a 1A checkpoint under a config with 1A off raises.
+    missing, input_res_missing = split_checkpoint_keys(model, missing, unexpected)
+    if input_res_missing:
+        print(f"[ckpt] no 1A weights in this checkpoint, kept at their initial values: {input_res_missing}", flush=True)
     if missing or unexpected:
         raise SystemExit("FATAL: ckpt did not load cleanly (see missing/unexpected above)")
+    input_res = getattr(model, "input_res", None)
+    problem = input_res.missing_statistics() if input_res is not None else None
+    if problem:
+        raise SystemExit(f"FATAL: {problem}")
 
     loader = _data.create_data_loader(config, framework="pytorch", shuffle=True, num_batches=args.batches)
     return model, loader, device, dtype
